@@ -16,6 +16,7 @@ Each mixin lives in its own module:
 * :class:`flashdrive._compile.TorchCompileMixin` — torch.compile/cudagraph machinery
 * :class:`flashdrive.streaming.StreamingMixin` — streaming
 * :class:`flashdrive.dflash.DFlashMixin` — speculative decoding
+* :class:`flashdrive.decode.AutoregressiveMixin` — autoregressive decode when DFlash is off
 * :class:`flashdrive.quantization.ParoQuantMixin` — W4A8 quantization
 * :class:`flashdrive.fusion.ExpertFusionMixin` — expert projection fusion
 """
@@ -29,6 +30,7 @@ from transformers import PretrainedConfig
 
 from flashdrive._base import FlashDriveBaseMixin
 from flashdrive._compile import TorchCompileMixin
+from flashdrive.decode import AutoregressiveMixin
 from flashdrive.dflash import DFlashMixin
 from flashdrive.fusion import ExpertFusionMixin
 from flashdrive.quantization import ParoQuantMixin
@@ -36,7 +38,10 @@ from flashdrive.streaming import StreamingMixin
 
 # Library convention: attach a no-op handler so importing FlashDrive never emits
 # logs unless the application configures logging itself.
-logging.getLogger(__name__).addHandler(logging.NullHandler())
+logger = logging.getLogger(__name__)
+# Library convention: attach a no-op handler so importing FlashDrive never emits
+# logs unless the application configures logging itself.
+logger.addHandler(logging.NullHandler())
 
 
 class FlashDriveMixin(
@@ -44,6 +49,7 @@ class FlashDriveMixin(
     TorchCompileMixin,
     StreamingMixin,
     DFlashMixin,
+    AutoregressiveMixin,
     ParoQuantMixin,
     ExpertFusionMixin,
 ):
@@ -53,7 +59,9 @@ class FlashDriveMixin(
     them in dependency order (``setup_rollout`` first — it patches the backbone
     forwards the other setups build on). Mixins never call each other, and shared
     state has one writer: the base owns the cache and prompt token ids, streaming
-    publishes the position tables, dflash publishes the block size.
+    publishes the position tables, dflash publishes the block size. The
+    autoregressive path is the exception: it reuses DFlash's one-token trajectory
+    forward and does not load a draft.
     """
 
 
@@ -88,15 +96,20 @@ def from_pretrained(
     model_path: str,
     device: str | torch.device = "cuda",
     torch_compile: str | None = "max-autotune",
+    *,
+    dflash: bool = True,
+    paroquant: bool = True,
 ) -> torch.nn.Module:
     """Load an Alpamayo model from ``model_path`` — optimized FlashDrive or original.
 
-    A ``z-lab`` checkpoint loads the full FlashDrive stack, fetching its ``-PARO``
-    / ``-DFlash`` companions by suffix; an upstream ``nvidia`` checkpoint loads
-    the original model. Either way the Alpamayo release is resolved from the
-    checkpoint's config and the model runs on sdpa (no flash-attn).
-    ``torch_compile`` sets the compile mode for the rollout's primitives
-    (``None`` = eager); it is ignored for the original model.
+    A ``z-lab`` checkpoint loads the FlashDrive stack. Streaming, action-cache
+    hooks, expert fusion, and ``torch.compile`` always stay on. ``dflash`` loads
+    the ``-DFlash`` draft; ``paroquant`` loads the ``-PARO`` W4A8 checkpoint.
+    Either flag can be turned off for the ablation. An upstream ``nvidia``
+    checkpoint loads the original model and ignores both flags. The Alpamayo
+    release is resolved from the checkpoint's config and the model runs on sdpa
+    (no flash-attn). ``torch_compile`` sets the compile mode for the rollout's
+    primitives (``None`` = eager); it is ignored for the original model.
     """
     # Everything runs on sdpa, so nothing needs flash-attn. The alpamayo loader
     # builds the VLM from the custom ``attn_implementation``, transformers' load
@@ -109,15 +122,32 @@ def from_pretrained(
     model = model_cls.from_pretrained(model_path, config=config, dtype=torch.bfloat16)
     model = model.to(device).eval()
     if not _is_optimized(model_path):
+        if not dflash or not paroquant:
+            logger.info(
+                "Ignoring dflash=%s paroquant=%s for non-z-lab checkpoint %s",
+                dflash,
+                paroquant,
+                model_path,
+            )
         return model
 
     model.__class__ = type(f"FlashDrive{model_cls.__name__}", (FlashDriveMixin, model_cls), {})
     model.setup_rollout()
     model.setup_torch_compile(torch_compile)
     model.setup_streaming(extended_vision_ranges=_EXTENDED_VISION_RANGES[model_cls])
-    model.setup_paroquant(f"{model_path}-PARO")
+    if paroquant:
+        model.setup_paroquant(f"{model_path}-PARO")
     model.setup_expert_fusion()
-    model.setup_dflash(f"{model_path}-DFlash")
+    if dflash:
+        model.setup_dflash(f"{model_path}-DFlash")
+    else:
+        model.setup_autoregressive()
+    logger.info(
+        "FlashDrive features: streaming=on fusion=on compile=%s dflash=%s paroquant=%s",
+        torch_compile,
+        dflash,
+        paroquant,
+    )
     return model
 
 

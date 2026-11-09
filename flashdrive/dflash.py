@@ -247,6 +247,7 @@ class DFlashMixin:
         The draft's config must define ``mask_token_id``; block size, context length,
         and the target capture layers all come from the checkpoint.
         """
+        self._use_dflash = True
         param = next(self.parameters())
 
         logger.info("Loading DFlash draft model from %s", checkpoint_path)
@@ -511,6 +512,8 @@ class DFlashMixin:
                 top_p,
             )
             acceptance_length, stop_at, period_flag = stats.tolist()
+            if self.stage_timing:
+                self._acceptance_rounds.append(int(acceptance_length))
 
             output_ids[:, start : start + acceptance_length + 1] = block[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
@@ -580,9 +583,6 @@ class DFlashMixin:
         Returns the full token sequence (window input + generated CoT + the
         trajectory-start token); the shared action-expert tail runs in the driver.
         """
-        device = input_ids.device
-        batch_size = input_ids.shape[0]
-
         logits, target_hidden = self._dflash_prefill(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
@@ -591,6 +591,36 @@ class DFlashMixin:
             deepstack_image_embeds=deepstack_image_embeds,
             streaming_attention_mask=streaming_attention_mask,
         )
+        return self._dflash_decode(
+            input_ids=input_ids,
+            logits=logits,
+            target_hidden=target_hidden,
+            position_ids=position_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+    def _dflash_decode(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        logits: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> torch.Tensor:
+        """Speculative decode from prefill logits until ``<cot_end>``, then the traj token.
+
+        Returns the same layout as :meth:`_dflash_generate`: window tokens, CoT, and
+        one trajectory-start token.
+        """
+        device = input_ids.device
+        batch_size = input_ids.shape[0]
+        if self.stage_timing:
+            self._acceptance_rounds = []
 
         num_input_tokens = self.prefill_seq_length
         max_length = num_input_tokens + max_new_tokens

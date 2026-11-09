@@ -4,6 +4,10 @@ The checkpoint org selects the mode: z-lab checkpoints run the optimized FlashDr
 stack (streaming + DFlash + W4A8 + expert fusion + action caching + compile), while
 upstream (nvidia) checkpoints run the original model, for before/after timing. The
 Alpamayo release (1 vs 1.5) is resolved from the checkpoint's config.
+
+``--no-dflash`` and ``--no-paroquant`` turn those two features off on a z-lab
+checkpoint. Streaming, action caching, expert fusion, and compile stay on.
+``--stage-timing`` records Encode / Prefill / Decode / Action on that path.
 """
 
 import argparse
@@ -38,6 +42,8 @@ torch.set_float32_matmul_precision("high")
 MAX_NEW_TOKENS = 128
 DIFFUSION_STEPS = 8
 CACHE_STEPS = [3, 4, 5, 6]
+DEFAULT_CLIP_ID = "87147a1b-3eef-4c25-94d2-ec7718a49a7a"
+_STAGE_NAMES = ("encode", "prefill", "decode", "action")
 
 
 def load_helper(model_path: str) -> ModuleType:
@@ -155,25 +161,10 @@ def run_inference(sample: Callable, model_inputs: dict, log: bool = True) -> flo
     return min_ade
 
 
-def run_benchmark(sample: Callable, all_inputs: list[dict], warmup_steps: int) -> None:
-    """Warm up, then time per-window inference and report minADE + latency stats."""
-    logger.info("Warmup")
-    for model_inputs in all_inputs[:warmup_steps]:
-        run_inference(sample, model_inputs, log=False)
-    logger.info("Warmup completed")
-
-    min_ades, latencies = [], []
-    for step, model_inputs in enumerate(all_inputs[warmup_steps:], warmup_steps + 1):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        min_ades.append(run_inference(sample, model_inputs))
-        torch.cuda.synchronize()
-        latencies.append((time.perf_counter() - t0) * 1000.0)
-        logger.info("Step %d/%d completed | Latency: %.1f ms", step, len(all_inputs), latencies[-1])
-
-    logger.info("Average MinADE: %.4f", np.mean(min_ades))
+def _log_latency(latencies: list[float], *, label: str = "LATENCY_SUMMARY") -> None:
     logger.info(
-        "LATENCY_SUMMARY ms: mean=%.1f median=%.1f min=%.1f p90=%.1f n=%d",
+        "%s ms: mean=%.1f median=%.1f min=%.1f p90=%.1f n=%d",
+        label,
         np.mean(latencies),
         np.median(latencies),
         np.min(latencies),
@@ -182,12 +173,140 @@ def run_benchmark(sample: Callable, all_inputs: list[dict], warmup_steps: int) -
     )
 
 
+def _log_stages(
+    stages: list[dict[str, float]],
+    latencies: list[float],
+    generated: list[int],
+    acceptance_sum: float,
+    num_rounds: int,
+    *,
+    label: str = "STAGE_SUMMARY",
+    decode_label: str = "DECODE_SUMMARY",
+) -> None:
+    """Log per-stage GPU time. ``latencies`` is aligned with ``stages`` (host e2e)."""
+    if not stages:
+        return
+    columns = []
+    sums = np.zeros(len(stages))
+    for name in _STAGE_NAMES:
+        values = np.array([row[name] for row in stages])
+        sums += values
+        columns.append(f"{name}_mean={values.mean():.1f} {name}_median={np.median(values):.1f}")
+    e2e = np.asarray(latencies, dtype=np.float64)
+    logger.info(
+        "%s ms: %s sum_mean=%.1f e2e_mean=%.1f residual_mean=%.1f n=%d",
+        label,
+        " ".join(columns),
+        float(sums.mean()),
+        float(e2e.mean()),
+        float((e2e - sums).mean()),
+        len(stages),
+    )
+    acceptance = f"{acceptance_sum / num_rounds:.2f}" if num_rounds else "na"
+    rounds = f"{num_rounds / len(generated):.2f}" if generated and num_rounds else "na"
+    generated_mean = f"{float(np.mean(generated)):.2f}" if generated else "na"
+    logger.info(
+        "%s generated_mean=%s acceptance_mean=%s rounds_mean=%s n=%d",
+        decode_label,
+        generated_mean,
+        acceptance,
+        rounds,
+        len(generated),
+    )
+
+
+def run_benchmark(
+    sample: Callable,
+    all_inputs: list[dict],
+    warmup_steps: int,
+    model: torch.nn.Module | None = None,
+    stage_timing: bool = False,
+) -> dict[str, Any]:
+    """Warm up, then time per-window inference and report minADE + latency stats.
+
+    When ``stage_timing`` is set, also read the four CUDA-event stages the
+    FlashDrive rollout recorded. Window 0 has no stages and is left out of that
+    summary. Returns the measured rows so several clips can be pooled.
+    """
+    logger.info("Warmup")
+    for model_inputs in all_inputs[:warmup_steps]:
+        run_inference(sample, model_inputs, log=False)
+    logger.info("Warmup completed")
+
+    min_ades: list[float] = []
+    latencies: list[float] = []
+    stage_rows: list[dict[str, float]] = []
+    stage_latencies: list[float] = []
+    generated: list[int] = []
+    acceptance_sum = 0.0
+    num_rounds = 0
+    for step, model_inputs in enumerate(all_inputs[warmup_steps:], warmup_steps + 1):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        min_ades.append(run_inference(sample, model_inputs))
+        torch.cuda.synchronize()
+        latencies.append((time.perf_counter() - t0) * 1000.0)
+        stages = model.consume_stage_ms() if stage_timing and model is not None else None
+        if stages is None:
+            logger.info(
+                "Step %d/%d completed | Latency: %.1f ms", step, len(all_inputs), latencies[-1]
+            )
+            continue
+        stage_rows.append(stages)
+        stage_latencies.append(latencies[-1])
+        logger.info(
+            "Step %d/%d completed | Latency: %.1f ms | encode=%.1f prefill=%.1f "
+            "decode=%.1f action=%.1f",
+            step,
+            len(all_inputs),
+            latencies[-1],
+            stages["encode"],
+            stages["prefill"],
+            stages["decode"],
+            stages["action"],
+        )
+        stats = getattr(model, "last_decode_stats", None)
+        if stats:
+            generated.append(int(stats["num_generated"]))
+            acceptance_sum += float(stats.get("acceptance_sum", 0.0))
+            num_rounds += int(stats.get("num_rounds", 0))
+
+    logger.info("Average MinADE: %.4f", np.mean(min_ades))
+    _log_latency(latencies)
+    _log_stages(stage_rows, stage_latencies, generated, acceptance_sum, num_rounds)
+    return {
+        "min_ades": min_ades,
+        "latencies": latencies,
+        "stages": stage_rows,
+        "stage_latencies": stage_latencies,
+        "generated": generated,
+        "acceptance_sum": acceptance_sum,
+        "num_rounds": num_rounds,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-path",
         default="z-lab/Alpamayo-1.5-10B",
         help="Base checkpoint. z-lab runs optimized FlashDrive; nvidia runs the original model.",
+    )
+    parser.add_argument(
+        "--no-dflash",
+        action="store_true",
+        help="On a z-lab checkpoint, decode autoregressively. Streaming, action cache, "
+        "and system optimizations stay on.",
+    )
+    parser.add_argument(
+        "--no-paroquant",
+        action="store_true",
+        help="On a z-lab checkpoint, keep the bf16 language model instead of W4A8.",
+    )
+    parser.add_argument(
+        "--stage-timing",
+        action="store_true",
+        help="Record Encode, Prefill, Decode, and Action GPU time on the FlashDrive path.",
     )
     parser.add_argument("--num-steps", type=int, default=120, help="Total windows to run.")
     parser.add_argument(
@@ -205,8 +324,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--clip-id",
-        default="87147a1b-3eef-4c25-94d2-ec7718a49a7a",
-        help="PhysicalAI-AV clip to evaluate.",
+        action="append",
+        dest="clip_ids",
+        default=None,
+        help=(
+            f"PhysicalAI-AV clip to evaluate. Repeat for several clips. Default: {DEFAULT_CLIP_ID}."
+        ),
     )
     parser.add_argument("--t0-us", type=int, default=1_700_000, help="Clip start time (us).")
     parser.add_argument("--time-step-us", type=int, default=100_000, help="Window stride (us).")
@@ -214,22 +337,64 @@ def main() -> None:
     args = parser.parse_args()
 
     helper = load_helper(args.model_path)
-    model = flashdrive.from_pretrained(args.model_path, device=args.device)
+    model = flashdrive.from_pretrained(
+        args.model_path,
+        device=args.device,
+        dflash=not args.no_dflash,
+        paroquant=not args.no_paroquant,
+    )
     optimized = isinstance(model, flashdrive.FlashDriveMixin)
+    stage_timing = bool(args.stage_timing and optimized)
+    if args.stage_timing and not optimized:
+        logger.info(
+            "Stage timing applies to the FlashDrive path only; reporting end-to-end latency."
+        )
+    if stage_timing:
+        model.stage_timing = True
     processor = helper.get_processor(model.tokenizer)
     sample = make_sample_fn(helper, model, optimized, args.device, args.num_traj_samples)
+    clip_ids = args.clip_ids or [DEFAULT_CLIP_ID]
 
-    logger.info("Loading inputs...")
-    all_inputs = create_inputs(
-        helper,
-        processor,
-        args.num_steps,
-        args.clip_id,
-        args.t0_us,
-        args.time_step_us,
-        streaming=optimized,
-    )
-    run_benchmark(sample, all_inputs, args.warmup_steps)
+    pooled: list[dict[str, Any]] = []
+    for clip_id in clip_ids:
+        if optimized:
+            model.reset_stream()
+        if len(clip_ids) > 1:
+            logger.info("Clip %s", clip_id)
+        logger.info("Loading inputs...")
+        all_inputs = create_inputs(
+            helper,
+            processor,
+            args.num_steps,
+            clip_id,
+            args.t0_us,
+            args.time_step_us,
+            streaming=optimized,
+        )
+        pooled.append(
+            run_benchmark(
+                sample,
+                all_inputs,
+                args.warmup_steps,
+                model=model,
+                stage_timing=stage_timing,
+            )
+        )
+
+    if len(pooled) > 1:
+        _log_latency(
+            [value for run in pooled for value in run["latencies"]],
+            label="POOLED_LATENCY_SUMMARY",
+        )
+        _log_stages(
+            [row for run in pooled for row in run["stages"]],
+            [value for run in pooled for value in run["stage_latencies"]],
+            [value for run in pooled for value in run["generated"]],
+            sum(run["acceptance_sum"] for run in pooled),
+            sum(run["num_rounds"] for run in pooled),
+            label="POOLED_STAGE_SUMMARY",
+            decode_label="POOLED_DECODE_SUMMARY",
+        )
 
 
 if __name__ == "__main__":
