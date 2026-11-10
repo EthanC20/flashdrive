@@ -10,6 +10,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+export UV_CACHE_DIR=/root/.cache/uv
+
 if [[ ! -f "$ROOT/.venv/bin/activate" ]]; then
   echo "Missing $ROOT/.venv. Run 'uv sync' in the repo first."
   exit 1
@@ -38,6 +40,10 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONUNBUFFERED=1
+# 权重在本地盘。网络盘上的 mmap 会把加载拖到小时级。
+export HF_HUB_CACHE="${HF_HUB_CACHE:-/root/.cache/huggingface/hub}"
+mkdir -p "$HF_HUB_CACHE"
+
 
 if ! command -v flock >/dev/null 2>&1; then
   echo "flock is required so two tmux windows cannot load the model at once."
@@ -60,9 +66,12 @@ printf 'index\tclip_id\tconfig\tlog\tstart\tend\texit_code\tgpu_memory_mib\tcomm
 trap 'echo "Interrupted. Partial logs: $OUT"; exit 130' INT TERM
 
 clips=(
-  "87147a1b-3eef-4c25-94d2-ec7718a49a7a"
-  "2ac89a4c-fa8e-4ad5-9aea-bab053f83ec1"
-  "c84309d5-6f92-44f7-9170-a4ea6b13cc7b"
+  # "87147a1b-3eef-4c25-94d2-ec7718a49a7a"
+  # "2ac89a4c-fa8e-4ad5-9aea-bab053f83ec1"
+  # "c84309d5-6f92-44f7-9170-a4ea6b13cc7b"
+  "85d55621-5ba1-4a93-8ce8-0e9883a649ff"
+  "0debc092-2aea-4ef2-b2d8-9c44d51f3767"
+  "dfd9b1d8-064c-4cec-9dc6-16622fb834ee"
 )
 # name|extra infer.py flags. full 不加开关。
 configs=(
@@ -75,8 +84,9 @@ configs=(
 failures=0
 index=0
 
+total=$(( ${#clips[@]} * ${#configs[@]} ))
 echo "Ablation logs: $OUT"
-echo "Runs: 12 sequential processes, num_steps=$NUM_STEPS warmup_steps=$WARMUP_STEPS"
+echo "Runs: ${total} sequential processes, num_steps=$NUM_STEPS warmup_steps=$WARMUP_STEPS"
 
 for clip in "${clips[@]}"; do
   short="${clip%%-*}"
@@ -103,7 +113,7 @@ for clip in "${clips[@]}"; do
     fi
 
     start="$(date -Is)"
-    echo "=== [${idx}/12] ${short} ${name} ==="
+    echo "=== [${idx}/${total}] ${short} ${name} ==="
     {
       printf 'command:'
       printf ' %q' "${cmd[@]}"
@@ -140,4 +150,4 @@ if [[ "$failures" -ne 0 ]]; then
   echo "${failures} run(s) failed."
   exit 1
 fi
-echo "All 12 runs finished."
+echo "All ${total} runs finished."
